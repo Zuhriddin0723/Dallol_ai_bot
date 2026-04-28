@@ -60,6 +60,7 @@ client = anthropic.Anthropic(api_key=CLAUDE_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 monitor_bot = Bot(token=MONITOR_BOT_TOKEN)
 dp = Dispatcher()
+monitor_dp = Dispatcher()
 
 class OrderState(StatesGroup):
     waiting_for_name = State()
@@ -364,9 +365,49 @@ async def private_handler(message: types.Message, state: FSMContext):
         register_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
         await process_ai_message(message.from_user.id, message.chat.id, message.text, state)
 
+# --- MONITOR BOT HANDLERS ---
+
+@monitor_dp.message(Command("start"))
+async def monitor_start(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS: return
+    await message.answer("Assalomu alaykum! Bu monitoring boti. Suhbat tarixini ko'rish uchun `/history_ID` buyrug'idan foydalaning.", parse_mode="Markdown")
+
+@monitor_dp.message(F.text.startswith("/history_"))
+async def monitor_history(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS: return
+    uid = message.text.replace("/history_", "").strip()
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role, content, timestamp FROM messages WHERE user_id = ? ORDER BY timestamp ASC", (uid,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        await message.answer(f"ID: {uid} uchun tarix topilmadi.")
+        return
+        
+    history_text = f"📜 Foydalanuvchi {uid} suhbat tarixi:\n\n"
+    for r in rows:
+        role = "👤 MIJOZ" if r[0] == "user" else "🤖 BOT"
+        history_text += f"[{r[2]}]\n{role}: {r[1]}\n\n"
+    
+    if len(history_text) > 4096:
+        for x in range(0, len(history_text), 4096):
+            await message.answer(history_text[x:x+4096])
+    else:
+        await message.answer(history_text)
+
 async def main():
+    logging.basicConfig(level=logging.INFO)
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await monitor_bot.delete_webhook(drop_pending_updates=True)
+    
+    # Ikkala botni ham parallel ravishda ishga tushiramiz
+    await asyncio.gather(
+        dp.start_polling(bot),
+        monitor_dp.start_polling(monitor_bot)
+    )
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
