@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sqlite3
+import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -20,6 +21,7 @@ class AddProduct(StatesGroup):
     max_price = State()
     sizes = State()
     colors = State()
+    material = State()
     stock = State()
     photo = State()
 
@@ -45,8 +47,36 @@ def get_admin_keyboard():
 def init_db():
     conn = sqlite3.connect("products.db")
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, min_price INTEGER, max_price INTEGER, sizes TEXT, colors TEXT, stock INTEGER DEFAULT 0, photo_id TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, product_name TEXT, customer_name TEXT, customer_phone TEXT, customer_address TEXT, agreed_price INTEGER, status TEXT DEFAULT 'yangi')''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        min_price INTEGER,
+        max_price INTEGER,
+        sizes TEXT,
+        colors TEXT,
+        material TEXT,
+        stock INTEGER DEFAULT 0,
+        photo_id TEXT,
+        file_unique_id TEXT
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_name TEXT,
+        customer_name TEXT,
+        customer_phone TEXT,
+        customer_address TEXT,
+        agreed_price INTEGER,
+        status TEXT DEFAULT 'yangi'
+    )''')
+
+    # Migratsiya: yangi ustunlarni qo'shish (eski baza bo'lsa)
+    cursor.execute("PRAGMA table_info(products)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "material" not in columns:
+        cursor.execute("ALTER TABLE products ADD COLUMN material TEXT")
+    if "file_unique_id" not in columns:
+        cursor.execute("ALTER TABLE products ADD COLUMN file_unique_id TEXT")
+
     conn.commit()
     conn.close()
 
@@ -78,50 +108,58 @@ async def process_min(message: types.Message, state: FSMContext):
 @dp.message(AddProduct.max_price)
 async def process_max(message: types.Message, state: FSMContext):
     await state.update_data(max_price=int(message.text))
-    await message.answer("Razmerlari:")
+    await message.answer("Razmerlari (masalan: S, M, L, XL):")
     await state.set_state(AddProduct.sizes)
 
 @dp.message(AddProduct.sizes)
 async def process_sizes(message: types.Message, state: FSMContext):
     await state.update_data(sizes=message.text)
-    await message.answer("Ranglari:")
+    await message.answer("Ranglari (masalan: Qizil, Ko'k, Yashil):")
     await state.set_state(AddProduct.colors)
 
 @dp.message(AddProduct.colors)
 async def process_colors(message: types.Message, state: FSMContext):
     await state.update_data(colors=message.text)
+    await message.answer("Materiali (Mato turi, masalan: Paxta, Lyukra):")
+    await state.set_state(AddProduct.material)
+
+@dp.message(AddProduct.material)
+async def process_material(message: types.Message, state: FSMContext):
+    await state.update_data(material=message.text)
     await message.answer("Qolgan miqdori (Stock):")
     await state.set_state(AddProduct.stock)
 
 @dp.message(AddProduct.stock)
 async def process_stock(message: types.Message, state: FSMContext):
     await state.update_data(stock=int(message.text))
-    await message.answer("Rasm yuboring (Dallol botda rasm chiqishi uchun rasmni o'sha botga ham yuklash kerak):")
+    await message.answer("Rasm yuboring:")
     await state.set_state(AddProduct.photo)
 
 @dp.message(AddProduct.photo, F.photo | F.text)
 async def process_photo(message: types.Message, state: FSMContext):
     data = await state.get_data()
     photo_name = f"{data['name']}.jpg"
-    
-    # Photos papkasini yaratish
-    import os
+    file_unique_id = None
+
     if not os.path.exists("photos"):
         os.makedirs("photos")
-    
+
     if message.photo:
-        # Rasmni kompyuterga yuklab olish
-        file_id = message.photo[-1].file_id
-        file = await bot.get_file(file_id)
+        # Rasmni kompyuterga yuklab olish va file_unique_id ni saqlash
+        photo = message.photo[-1]
+        file_unique_id = photo.file_unique_id
+        file = await bot.get_file(photo.file_id)
         await bot.download_file(file.file_path, f"photos/{photo_name}")
-    
+
     conn = sqlite3.connect("products.db")
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO products (name, min_price, max_price, sizes, colors, stock, photo_id) VALUES (?,?,?,?,?,?,?)",
-                       (data['name'], data['min_price'], data['max_price'], data['sizes'], data['colors'], data['stock'], photo_name))
+        cursor.execute(
+            "INSERT INTO products (name, min_price, max_price, sizes, colors, material, stock, photo_id, file_unique_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (data['name'], data['min_price'], data['max_price'], data['sizes'], data['colors'], data['material'], data['stock'], photo_name, file_unique_id)
+        )
         conn.commit()
-        await message.answer("✅ Mahsulot va rasm muvaffaqiyatli saqlandi!")
+        await message.answer(f"✅ Mahsulot muvaffaqiyatli saqlandi!\n\n📦 {data['name']}\n💰 {data['min_price']} - {data['max_price']} so'm\n📐 {data['sizes']}\n🎨 {data['colors']}\n🧵 {data['material']}\n📊 Stock: {data['stock']}")
     except Exception as e:
         await message.answer(f"Xatolik: {e}")
     conn.close()
@@ -132,10 +170,13 @@ async def cmd_list(message: types.Message):
     if not is_admin(message.from_user.id): return
     conn = sqlite3.connect("products.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, stock FROM products")
+    cursor.execute("SELECT id, name, stock, min_price, max_price, material FROM products")
     rows = cursor.fetchall()
     conn.close()
-    text = "\n".join([f"ID: {r[0]} | {r[1]} (Stock: {r[2]})" for r in rows]) if rows else "Baza bo'sh."
+    if not rows:
+        await message.answer("Baza bo'sh.")
+        return
+    text = "\n\n".join([f"🆔 ID: {r[0]}\n📦 {r[1]}\n💰 {r[3]} - {r[4]} so'm\n🧵 {r[5] or 'Noma\\'lum'}\n📊 Stock: {r[2]}" for r in rows])
     await message.answer(f"📦 Mahsulotlar:\n\n{text}")
 
 @dp.message(F.text == "📝 Tahrirlash")
@@ -150,7 +191,7 @@ async def edit_id_received(message: types.Message, state: FSMContext):
         await message.answer("Raqam yozing!")
         return
     await state.update_data(product_id=message.text)
-    await message.answer("Nimani o'zgartiramiz? (name, stock, min_price, max_price, sizes, colors)")
+    await message.answer("Nimani o'zgartiramiz? (name, stock, min_price, max_price, sizes, colors, material)")
     await state.set_state(EditProduct.field)
 
 @dp.message(EditProduct.field)
@@ -165,11 +206,12 @@ async def edit_value(message: types.Message, state: FSMContext):
     conn = sqlite3.connect("products.db")
     cursor = conn.cursor()
     # SQL injection dan himoya uchun field nomi tekshiriladi
-    allowed_fields = ['name', 'stock', 'min_price', 'max_price', 'sizes', 'colors']
+    allowed_fields = ['name', 'stock', 'min_price', 'max_price', 'sizes', 'colors', 'material']
     if data['field'] not in allowed_fields:
         await message.answer("Bunday maydon yo'q!")
+        await state.clear()
         return
-        
+
     cursor.execute(f"UPDATE products SET {data['field']} = ? WHERE id = ?", (message.text, data['product_id']))
     conn.commit()
     conn.close()
@@ -187,7 +229,7 @@ async def process_delete(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
         await message.answer("Iltimos, faqat raqam yozing!")
         return
-    
+
     pid = message.text
     conn = sqlite3.connect("products.db")
     cursor = conn.cursor()
@@ -209,7 +251,7 @@ async def cmd_orders(message: types.Message):
         await message.answer("Yangi buyurtmalar yo'q.")
         return
     for r in rows:
-        await message.answer(f"🆕 Buyurtma #{r[0]}\nMahsulot: {r[1]}\nMijoz: {r[2]}, {r[3]}\nManzil: {r[4]}\nNarx: {r[5]}\n/done_{r[0]}")
+        await message.answer(f"🆕 Buyurtma #{r[0]}\nMahsulot: {r[1]}\nMijoz: {r[2]}, {r[3]}\nManzil: {r[4]}\nNarx: {r[5]} so'm\n\n/done_{r[0]}")
 
 @dp.message(F.text.startswith("/done_"))
 async def cmd_done(message: types.Message):
