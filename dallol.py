@@ -33,7 +33,7 @@ class OrderState(StatesGroup):
     waiting_for_address = State()
     waiting_for_confirmation = State()
 
-# --- BAZA BILAN ISHLASH ---
+# --- BAZA BILAN ISHLASH --- 
 def get_all_products():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
