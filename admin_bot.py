@@ -373,7 +373,8 @@ async def cmd_history(message: types.Message):
         
     history_text = f"📜 Foydalanuvchi {uid} suhbat tarixi:\n\n"
     for r in rows:
-        history_text += f"[{r[2]}] {r[0].upper()}: {r[1]}\n"
+        role = "👤 MIJOZ" if r[0] == "user" else "🤖 BOT"
+        history_text += f"[{r[2]}]\n{role}: {r[1]}\n\n"
     
     # Monitoring botga yuborish
     try:

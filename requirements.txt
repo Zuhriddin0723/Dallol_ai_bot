@@ -1,2 +1,4 @@
 aiogram
 anthropic
+python-dotenv
+aiohttp

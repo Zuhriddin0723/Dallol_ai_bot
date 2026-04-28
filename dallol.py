@@ -22,6 +22,40 @@ PHOTOS_DIR = os.path.join(BASE_DIR, "photos")
 DB_PATH = os.path.join(BASE_DIR, "products.db")
 os.makedirs(PHOTOS_DIR, exist_ok=True)
 
+def get_last_3_products():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, max_price FROM products ORDER BY id DESC LIMIT 3")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+async def send_product_to_dm(user_id, p_name):
+    # Mahsulot haqida ma'lumot olish
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, max_price, sizes, colors, material FROM products WHERE name = ?", (p_name,))
+    p = cursor.fetchone()
+    conn.close()
+    
+    if not p: return False
+    
+    text = f"📦 {p[0]}\n💰 Narxi: {p[1]} so'm\n📐 O'lcham: {p[2]}\n🎨 Rang: {p[3]}\n🧵 Material: {p[4]}\n\nSavdolashish uchun narxni yozing!"
+    
+    photos = get_product_photos(p_name)
+    try:
+        if photos:
+            if len(photos) > 1:
+                media = [InputMediaPhoto(media=ph, caption=text if i == 0 else "") for i, ph in enumerate(photos)]
+                await bot.send_media_group(user_id, media)
+            else:
+                await bot.send_photo(user_id, photos[0], caption=text)
+        else:
+            await bot.send_message(user_id, text)
+        return True
+    except:
+        return False
+
 client = anthropic.Anthropic(api_key=CLAUDE_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 monitor_bot = Bot(token=MONITOR_BOT_TOKEN)
@@ -113,35 +147,12 @@ def save_message_to_db(user_id, role, content):
     conn.close()
 
 async def log_interaction(user_id, user_msg, bot_msg=None):
-    # Test uchun admin tekshiruvini vaqtincha olib tashladik
-    # if user_id in ADMIN_IDS: return
-    
-    user_info = f"👤 Foydalanuvchi: {user_id}"
-    try:
-        u_chat = await bot.get_chat(user_id)
-        if u_chat.username: user_info += f" (@{u_chat.username})"
-        if u_chat.full_name: user_info += f" [{u_chat.full_name}]"
-    except Exception as e:
-        print(f"Chat info error: {e}")
-
     if user_msg:
         save_message_to_db(user_id, "user", user_msg)
     if bot_msg:
         save_message_to_db(user_id, "assistant", bot_msg)
     
-    for aid in ADMIN_IDS:
-        try:
-            if user_msg:
-                print(f"Logging to admin {aid}: {user_msg}")
-                await monitor_bot.send_message(aid, f"{user_info}\n📝 Xabar: {user_msg}")
-            if bot_msg:
-                print(f"Logging to admin {aid}: Bot response")
-                await monitor_bot.send_message(aid, f"🤖 Bot javobi (user: {user_id}):\n{bot_msg}")
-        except Exception as e:
-            if "chat not found" in str(e).lower():
-                print(f"Admin {aid} hali monitoring botga /start bosmagan.")
-            else:
-                print(f"Monitor bot error for admin {aid}: {e}")
+    # Real-time monitoring o'chirildi. Faqat bazaga saqlanadi.
 
 def register_user(user_id, username, full_name):
     conn = sqlite3.connect(DB_PATH)
@@ -238,15 +249,16 @@ async def process_ai_message(user_id, chat_id, text, state, show_typing=True):
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def group_handler(message: types.Message):
     raw_text = (message.text or message.caption or "").lower()
-    trigger_words = ["narx", "qancha", "necha pul", "som", "so'm"]
+    trigger_words = ["narx", "qancha", "necha pul", "som", "so'm", "nechi"]
     is_reply_to_photo = message.reply_to_message and message.reply_to_message.photo
-
-    if is_reply_to_photo or any(word in raw_text for word in trigger_words):
+    
+    if any(word in raw_text for word in trigger_words):
         user_id = message.from_user.id
-        p_name = None
+        me = await bot.get_me()
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Lichkada javob olish 💬", url=f"https://t.me/{me.username}?start=guruh")]])
 
         if is_reply_to_photo:
-            # file_unique_id orqali aniq mahsulotni topamiz
+            # Rasmga reply qilingan
             replied_unique_id = message.reply_to_message.photo[-1].file_unique_id
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
@@ -255,50 +267,27 @@ async def group_handler(message: types.Message):
                 WHERE id = (SELECT product_id FROM product_photos WHERE file_unique_id = ?)
             """, (replied_unique_id,))
             row = cursor.fetchone()
+            conn.close()
+            
             if row:
                 p_name = row[0]
+                success = await send_product_to_dm(user_id, p_name)
+                if not success:
+                    await message.reply(f"@{message.from_user.username}, narxni bilish uchun lichkamga o'ting!", reply_markup=markup)
             else:
-                # Agar topilmasa, caption orqali qidiramiz
-                caption = (message.reply_to_message.caption or "").lower()
-                cursor.execute("SELECT name FROM products")
-                all_p = cursor.fetchall()
-                for p in all_p:
-                    if p[0].lower() in caption:
-                        p_name = p[0]
-                        break
-            conn.close()
-
-        question = f"{p_name} haqida narx so'rayapman" if p_name else raw_text
-
-        # Shaxsiy chat state-ini olish
-        user_state = dp.fsm.get_context(bot, user_id, user_id)
-
-        try:
-            # Lichkaga yozishga harakat qilamiz
-            await process_ai_message(user_id, user_id, question, user_state)
-        except (TelegramForbiddenError, Exception):
-            # Agar lichkaga yozib bo'lmasa (bot start qilinmagan bo'lsa)
-            pending_questions[user_id] = {"question": question, "product_name": p_name}
-            me = await bot.get_me()
-            markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Lichkada javob olish 💬", url=f"https://t.me/{me.username}?start=guruh")]])
-            await message.reply(f"@{message.from_user.username}, narxni bilish uchun lichkamga o'ting!", reply_markup=markup)
-    else:
-        # Hech narsaga reply qilmasdan narx so'rasa
-        if any(word in raw_text for word in trigger_words) and not is_reply_to_photo:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, max_price, photo_id FROM products WHERE stock > 0 ORDER BY id DESC LIMIT 3")
-            last_products = cursor.fetchall()
-            conn.close()
-
-            await message.reply("Qaysi mahsulotni narxini so'rayapsiz? Marhamat, quyidagilardan birini tanlang yoki rasmga reply qilib so'rang. Mana oxirgi qo'shilgan mahsulotlar:")
+                await message.reply("Bu mahsulot topilmadi. Iltimos, rasmga reply qilib so'rang.")
+        else:
+            # Shunchaki narx so'ralgan
+            last_3 = get_last_3_products()
+            success_count = 0
+            for p in last_3:
+                if await send_product_to_dm(user_id, p[1]):
+                    success_count += 1
             
-            for p in last_products:
-                p_text = f"📦 {p[0]}\n💰 Narxi: {p[1]} so'm\n\nBatafsil ma'lumot uchun rasmga reply qiling."
-                if p[2] and os.path.exists(os.path.join(PHOTOS_DIR, p[2])):
-                    await bot.send_photo(message.chat.id, FSInputFile(os.path.join(PHOTOS_DIR, p[2])), caption=p_text)
-                else:
-                    await message.answer(p_text)
+            if success_count == 0:
+                await message.reply(f"@{message.from_user.username}, narxni bilish uchun lichkamga o'ting!", reply_markup=markup)
+            else:
+                await message.reply(f"@{message.from_user.username}, oxirgi mahsulotlarimizni lichkangizga yubordim!")
 
 @dp.message(OrderState.waiting_for_name)
 async def get_name(message: types.Message, state: FSMContext):
