@@ -1,21 +1,30 @@
 import asyncio
 import logging
 import sqlite3
+import httpx
 import re
 import os
-import anthropic
+from anthropic import AsyncAnthropic
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove, InputMediaPhoto
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove, InputMediaPhoto, BufferedInputFile
 from aiogram.exceptions import TelegramForbiddenError
 
+from dotenv import load_dotenv
+
+# .env faylini yuklash
+load_dotenv()
+
 # --- SOZLAMALAR ---
-TELEGRAM_TOKEN = "8772049993:AAEu_UCPZLvo5tvPkzyDhuA3Hq56lNf4guc"
-CLAUDE_KEY = "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"
-ADMIN_IDS = [1621989960, 7611428203]  # Barcha adminlar ID raqami
-MONITOR_BOT_TOKEN = "8681144550:AAH4ulohF2-JLA4RSLJzSgtlTXCVE8k8ZGI"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CLAUDE_KEY = os.getenv("CLAUDE_KEY", "").strip()
+MONITOR_BOT_TOKEN = os.getenv("MONITOR_BOT_TOKEN")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(aid) for aid in ADMIN_IDS_STR.split(",") if aid.strip()]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PHOTOS_DIR = os.path.join(BASE_DIR, "photos")
@@ -46,19 +55,25 @@ async def send_product_to_dm(user_id, p_name):
     try:
         if photos:
             if len(photos) > 1:
-                media = [InputMediaPhoto(media=ph, caption=text if i == 0 else "") for i, ph in enumerate(photos)]
+                media = []
+                for i, p_tuple in enumerate(photos):
+                    file_input = get_photo_input(p_tuple[0], p_tuple[1])
+                    media.append(InputMediaPhoto(media=file_input, caption=text if i == 0 else ""))
                 await bot.send_media_group(user_id, media)
             else:
-                await bot.send_photo(user_id, photos[0], caption=text)
+                file_input = get_photo_input(photos[0][0], photos[0][1])
+                await bot.send_photo(user_id, file_input, caption=text)
         else:
             await bot.send_message(user_id, text)
         return True
-    except:
+    except Exception as e:
+        logging.error(f"Error sending photo to DM: {e}")
         return False
 
-client = anthropic.Anthropic(api_key=CLAUDE_KEY)
-bot = Bot(token=TELEGRAM_TOKEN)
-monitor_bot = Bot(token=MONITOR_BOT_TOKEN)
+session = AiohttpSession(timeout=60.0)
+client = AsyncAnthropic(api_key=CLAUDE_KEY, timeout=60.0)
+bot = Bot(token=TELEGRAM_TOKEN, session=session)
+monitor_bot = Bot(token=MONITOR_BOT_TOKEN, session=session)
 dp = Dispatcher()
 monitor_dp = Dispatcher()
 
@@ -89,56 +104,141 @@ def get_product_photos(name):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT photo_id FROM product_photos 
+        SELECT photo_id, file_path, file_unique_id FROM product_photos 
         WHERE product_id = (SELECT id FROM products WHERE name = ?)
     """, (name,))
     rows = cursor.fetchall()
     conn.close()
-    return [r[0] for r in rows]
+    
+    results = []
+    for photo_id, file_path, file_unique_id in rows:
+        # Agar bazada file_path bo'lmasa yoki noto'g'ri bo'lsa, qidirib ko'ramiz
+        if not file_path or not os.path.exists(file_path):
+            # 1. file_unique_id bo'yicha (admin_bot shunday saqlaydi)
+            if file_unique_id:
+                p = os.path.join(PHOTOS_DIR, f"{file_unique_id}.jpg")
+                if os.path.exists(p): file_path = p
+            
+            # 2. Mahsulot nomi bo'yicha (lowercase)
+            if not file_path:
+                p = os.path.join(PHOTOS_DIR, f"{name.lower()}.jpg")
+                if os.path.exists(p): file_path = p
+            
+            # 3. Mahsulot nomi bo'yicha (aslida)
+            if not file_path:
+                p = os.path.join(PHOTOS_DIR, f"{name}.jpg")
+                if os.path.exists(p): file_path = p
+        
+        results.append((photo_id, file_path))
+    return results
+
+def get_photo_input(pid, ppath):
+    if ppath and os.path.exists(ppath):
+        return FSInputFile(ppath)
+    # Dallol bot admin_bot ning file_id sini ishlata olmaydi, shuning uchun None qaytaramiz
+    return None
 
 # --- AI PROMPT (QOIDALAR) ---
 def get_system_prompt():
     products = get_all_products()
-    products_text = "\n".join([f"- {p[0]}: {p[1]} - {p[2]} so'm (O'lcham: {p[3]}, Rang: {p[4]}, Material: {p[6]})" for p in products]) if products else "Hozircha mahsulot yo'q."
-    return f"""SEN "Anojram" do'konining "Dallol AI" botisan. Haqiqiy O'zbek dalloli kabi chaqqon va xushmuomala bo'l.
-Bizdagi mahsulotlar (FAQAT MIJOZ SO'RASA AYT):
-{products_text}
+    products_text = "\n".join([f"- Nomi: {p[0]} | Boshlang'ich narxi: {p[2]} so'm | Maxfiy minimum: {p[1]} so'm | O'lchamlari: {p[3]} | Ranglari: {p[4]} | Materiali: {p[6]} | Rasm yuborish: [SEND_PHOTO: {p[0]}]" for p in products]) if products else "Hozircha mahsulot yo'q."
+    return f"""SEN "Anojram" do'konining "Dallol AI" botisan. Haqiqiy O'zbek dalloli kabi chaqqon, xushmuomala va ishonchli bo'l.
+Sizga hozirda Vision (ko'rish) imkoniyati berilgan, ya'ni foydalanuvchi yuborgan yoki biz senga yuborgan mahsulot rasmlarini ko'ra olasan. 
+HECH QACHON "men rasm ko'ra olmayman" dema!
 
-QAT'IY QOIDALAR:
+<products>
+{products_text}
+</products>
+
+<rules>
 1. MIJOZ SO'RAMAGUNCHA MAHSULOTLARNI O'ZINGDAN TAKLIF QILMA.
 2. Agar mijoz shunchaki salom bersa yoki xol-ahvol so'rasa, xushmuomala bilan alik ol va "Sizga qanday yordam bera olaman?" deb so'ra.
-3. Mahsulotlar haqida mijoz so'ramagunicha gapirma.
-4. Narxni doim MAXIMUMdan boshla.
-5. Savdolashsa, MINIMUMdan pastga tushma.
-6. HAR DOIM FAQAT BITTA SAVOL BER.
-7. FAQAT BIRINCHI XABARDA SALOM BER. Ikkinchi xabardan boshlab salomlashish QAT'IYAN TAQIQLANADI.
-8. Kelishuv bo'lsa xabar oxiriga [DEAL_REACHED] qo'sh.
-9. Rasm ko'rsatish uchun [SEND_PHOTO: mahsulot_nomi] ishlat. Agar mijoz rasm so'rasa yoki birorta mahsulot haqida ma'lumot bersang, ALBATTA shu tagni xabaringga qo'sh.
+3. Foydalanuvchi birinchi yozganida salom ber. Ikkinchi xabardan boshlab salomlashish QAT'IYAN TAQIQLANADI.
+4. NARX SIYOSATI:
+   - Hech qachon foydalanuvchiga narx oralig'ini (minimumdan maximumgacha) aytma.
+   - FAQAT boshlang'ich Sotuv narxini (max_price) ayt.
+   - Agar mijoz "qimmat" desa yoki narx tushirishni so'rasa, xushmuomalalik bilan ozgina (10-20 ming so'm) tushib ber.
+   - Hech qachon Maxfiy minimumdan (min_price) pastga tushma!
+5. Agar mijoz taklifingga rozi bo'lsa, xabar oxiriga kelishilgan aniq narxni va [DEAL_REACHED] belgisini qo'sh.
+6. SAVOL BERISH QOIDASI: Har doim mijozga faqat va faqat bitta savol ber. Hech qachon birdaniga 2 ta yoki undan ko'p savol berma. Savollarni ketma-ket, bitta-bitta ber! Mijozni savollarga ko'mib tashlama.
+7. Kelishuv bo'lsa xabar oxiriga albatta kelishilgan narxni va [DEAL_REACHED] belgisini qo'sh (Masalan: "Kelishdik, 150000 so'm. [DEAL_REACHED]").
+8. RASM YUBORISH QOIDASI: 
+   - Agar foydalanuvchi aniq bir mahsulot haqida so'rasa, DOIM o'sha mahsulotning rasmini yuborish uchun [SEND_PHOTO: MahsulotNomi] belgisidan foydalan. Boshqa mahsulotlarni aralashtirma, faqat so'ralgan mahsulot rasmini ko'rsat.
+   - Agar senda juda zarur bo'lgan TASHQI rasm linki bo'lsa (va u bizning bazamizda bo'lmasa), [PHOTO_LINK: URL] formatidan foydalan. 
+   - Hech qachon Markdown formatini (![alt](link)) ishlatma.
+9. QISQA VA LONDA JAVOB:
+   - MAHSULOTLAR ro'yxatida yozilgan ranglar va o'lchamlarni aniq tekshirib, shunga qarab javob yoz. O'zingdan yo'q ranglarni yoki razmerlarni umuman to'qib chiqarma!
+   - Mahsulot narxini yoki rasmini so'rashganda, lirik chekinishlar qilma ("Xushmuolamiz", "Juda yaxshi", "Ko'rsataman", "Sizga bu narx mos keladimi" kabi ortiqcha gaplarni UMUMAN ishlatma).
+   - Faqat rasmini yubor ([SEND_PHOTO: Nomi]) va "Narxi: ... so'm" deb aniq yoz. Va kerak bo'lsa "Sizga qanday razmerdagisi yoki qanday rangi kerak?" deb qisqacha so'ra.
+10. SUHBAT DAVOMIYLIGI (KONTEKST):
+   - Mijoz oldingi savolingga (masalan o'lcham yoki rang haqidagi) javob berganda, hech qachon suhbatni boshidan boshlama! "Sizga qanday yordam bera olaman?" kabi gaplarni qayta ishlatma.
+   - Uning javobini (masalan "qizil") qabul qil va savdolashishni o'sha joyidan davom ettir.
+</rules>
 """
 
 # Claude uchun xabarlar tarixi (har user uchun alohida ro'yxat)
 chat_histories = {}
-pending_questions = {}
 
 def get_chat_history(user_id):
     if user_id not in chat_histories:
         chat_histories[user_id] = []
     return chat_histories[user_id]
 
-def send_claude_message(user_id, text):
+import base64
+
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+async def send_claude_message(user_id, text, image_path=None):
     history = get_chat_history(user_id)
-    history.append({"role": "user", "content": text})
+    
+    content = [{"type": "text", "text": text}]
+    if image_path and os.path.exists(image_path):
+        base64_image = encode_image(image_path)
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64_image,
+            },
+        })
+    
+    history.append({"role": "user", "content": content})
 
-    response = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=1024,
-        system=get_system_prompt(),
-        messages=history
-    )
-
-    assistant_text = response.content[0].text
-    history.append({"role": "assistant", "content": assistant_text})
-    return assistant_text
+    # Retry logic for network errors
+    for attempt in range(3):
+        try:
+            response = await client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1024,
+                system=get_system_prompt(),
+                messages=history
+            )
+            assistant_text = response.content[0].text
+            history.append({"role": "assistant", "content": assistant_text})
+            return assistant_text
+        except Exception as e:
+            # Agar model topilmasa (404), Haiku ga o'tamiz
+            if "not_found_error" in str(e).lower() and CLAUDE_MODEL != "claude-haiku-4-5-20251001":
+                logging.warning(f"Model {CLAUDE_MODEL} topilmadi, Haiku'ga o'tilmoqda...")
+                try:
+                    response = await client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=1024,
+                        system=get_system_prompt(),
+                        messages=history
+                    )
+                    assistant_text = response.content[0].text
+                    history.append({"role": "assistant", "content": assistant_text})
+                    return assistant_text
+                except Exception as e2:
+                    logging.error(f"Fallback model ham xato berdi: {e2}")
+            
+            if attempt == 2: raise e
+            logging.warning(f"AI attempt {attempt+1} failed: {e}. Retrying...")
+            await asyncio.sleep(2)
 
 def save_message_to_db(user_id, role, content):
     conn = sqlite3.connect(DB_PATH)
@@ -171,35 +271,9 @@ async def start_handler(message: types.Message, state: FSMContext):
     # Har safar start bosilganda yangi qoidalar ishlashi uchun suhbatni yangilaymiz
     chat_histories.pop(user_id, None)
 
-    if user_id in pending_questions:
-        q = pending_questions.pop(user_id)
-        p_name = q.get('product_name')
-
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT max_price FROM products WHERE name = ?", (p_name,))
-        p_data = cursor.fetchone()
-        conn.close()
-
-        if p_data:
-            price = p_data[0]
-            intro = f"Assalomu alaykum! Siz bizning telegram guruhimizda shu mahsulotni narhini so'ragan ekansiz. Mahsulotning narhi {price} so'm. Sizga qaysi rangdagisi kerak?"
-            
-            photos = get_product_photos(p_name)
-            if photos:
-                media = [InputMediaPhoto(media=p, caption=intro if i == 0 else "") for i, p in enumerate(photos)]
-                await bot.send_media_group(message.chat.id, media)
-            else:
-                await message.answer(intro)
-
-            # AI'ga vaziyatni tushuntiramiz (salom bermasligi uchun)
-            send_claude_message(user_id, f"Mijoz guruhda {p_name} mahsulotini narxini so'radi. Men unga salom berdim, narx {price} so'm ekanligini aytdim va rangini so'radim. SEN SALOM BERMASDAN, darhol muloqotni davom ettir va faqat bittadan savol ber.")
-        else:
-            await process_ai_message(user_id, message.chat.id, q['question'], state)
-    else:
-        welcome_msg = "Assalomu alaykum! Anojram do'konimizga xush kelibsiz. Sizga telegram guruhimizdagi qaysi mahsulotimiz yoqdi?"
-        await message.answer(welcome_msg)
-        await log_interaction(user_id, "/start", welcome_msg)
+    welcome_msg = "Assalomu alaykum! Anojram do'konimizga xush kelibsiz. Bizda ajoyib mahsulotlar bor. Sizga qanday yordam bera olaman?"
+    await message.answer(welcome_msg)
+    await log_interaction(user_id, "/start", welcome_msg)
 
 async def process_ai_message(user_id, chat_id, text, state, show_typing=True):
     if show_typing:
@@ -211,12 +285,12 @@ async def process_ai_message(user_id, chat_id, text, state, show_typing=True):
         # User xabarini monitoring botga yuborish
         await log_interaction(user_id, text)
 
-        res_text = send_claude_message(user_id, text)
+        res_text = await send_claude_message(user_id, text)
 
         # Bot javobini monitoring botga yuborish
         await log_interaction(user_id, None, res_text)
 
-        # Rasm yuborish mantiqi
+        # Rasm yuborish mantiqi (Local DB)
         photo_match = re.search(r"\[SEND_PHOTO:\s*(.+?)\]", res_text)
         if photo_match:
             p_name = photo_match.group(1).strip()
@@ -224,18 +298,65 @@ async def process_ai_message(user_id, chat_id, text, state, show_typing=True):
             photos = get_product_photos(p_name)
             if photos:
                 if len(photos) > 1:
-                    media = [InputMediaPhoto(media=p) for p in photos]
-                    await bot.send_media_group(chat_id, media)
+                    media = []
+                    for p_tuple in photos:
+                        file_input = get_photo_input(p_tuple[0], p_tuple[1])
+                        if file_input:
+                            media.append(InputMediaPhoto(media=file_input))
+                    if media:
+                        try:
+                            await bot.send_media_group(chat_id, media)
+                        except Exception as e:
+                            logging.error(f"Error sending local media group: {e}")
                 else:
-                    await bot.send_photo(chat_id, photos[0])
+                    file_input = get_photo_input(photos[0][0], photos[0][1])
+                    if file_input:
+                        try:
+                            await bot.send_photo(chat_id, file_input)
+                        except Exception as e:
+                            logging.error(f"Error sending local photo: {e}")
 
         res_text = re.sub(r"\[SEND_PHOTO:.*?\]", "", res_text).strip()
 
+        # Rasm yuborish mantiqi (URL Link)
+        link_match = re.search(r"\[PHOTO_LINK:\s*(https?://[^\s\]]+)\]", res_text)
+        if link_match:
+            photo_url = link_match.group(1).strip().rstrip(')]')
+            res_text = re.sub(r"\[PHOTO_LINK:.*?\]", "", res_text).strip()
+            
+            caption_text = res_text if res_text else "Mana siz so'ragan rasm!"
+            try:
+                # 1. To'g'ridan-to'g'ri URL orqali urinib ko'ramiz
+                await bot.send_photo(chat_id, photo=photo_url, caption=caption_text)
+                if "[DEAL_REACHED]" not in res_text:
+                    return
+            except Exception as e:
+                logging.warning(f"Direct URL photo sending failed, trying to download: {e}")
+                try:
+                    # 2. Yuklab olib yuborishga urinib ko'ramiz
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.get(photo_url, timeout=15.0)
+                        if resp.status_code == 200:
+                            photo_data = resp.content
+                            file_input = BufferedInputFile(photo_data, filename="photo.jpg")
+                            await bot.send_photo(chat_id, photo=file_input, caption=caption_text)
+                            if "[DEAL_REACHED]" not in res_text:
+                                return
+                        else:
+                            raise Exception(f"HTTP Status {resp.status_code}")
+                except Exception as e2:
+                    logging.error(f"Error downloading photo from URL: {e2}")
+                    # Oxirgi chora: xato xabarini yuboramiz
+                    await bot.send_message(chat_id, f"{caption_text}\n\n(Kechirasiz, rasm yuklanmadi, lekin mahsulot haqida ma'lumot yuqorida)")
+
         # Kelishuv bo'lganda
         if "[DEAL_REACHED]" in res_text:
-            prices = re.findall(r"(\d[\d\s]*)\s*(?:so'm|som|sum)", res_text.lower())
+            prices = re.findall(r"(\d[\d\s\.]*)\s*(?:so'm|som|sum)", res_text.lower())
             if prices:
-                await state.update_data(last_price=int(prices[-1].replace(" ", "")))
+                price_str = prices[-1].replace(" ", "").replace(".", "")
+                try:
+                    await state.update_data(last_price=int(price_str))
+                except: pass
 
             await bot.send_message(chat_id, res_text.replace("[DEAL_REACHED]", "").strip())
             await bot.send_message(chat_id, "Kelishdik! Ismingizni yozing:")
@@ -248,47 +369,70 @@ async def process_ai_message(user_id, chat_id, text, state, show_typing=True):
         await bot.send_message(chat_id, "Kechirasiz, birozdan keyin urinib ko'ring.")
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
-async def group_handler(message: types.Message):
+async def group_handler(message: types.Message, state: FSMContext):
     raw_text = (message.text or message.caption or "").lower()
-    trigger_words = ["narx", "qancha", "necha pul", "som", "so'm", "nechi"]
+    trigger_words = ["narx", "qancha", "necha pul", "som", "so'm", "nechi", "pul", "narxi"]
     is_reply_to_photo = message.reply_to_message and message.reply_to_message.photo
+    has_trigger_word = any(word in raw_text for word in trigger_words)
     
-    if any(word in raw_text for word in trigger_words):
+    if has_trigger_word:
         user_id = message.from_user.id
-        me = await bot.get_me()
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Lichkada javob olish 💬", url=f"https://t.me/{me.username}?start=guruh")]])
-
+        p_name = None
+        last_3 = None
         if is_reply_to_photo:
-            # Rasmga reply qilingan
             replied_unique_id = message.reply_to_message.photo[-1].file_unique_id
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT name FROM products 
-                WHERE id = (SELECT product_id FROM product_photos WHERE file_unique_id = ?)
-            """, (replied_unique_id,))
+            cursor.execute("SELECT name FROM products WHERE id = (SELECT product_id FROM product_photos WHERE file_unique_id = ?)", (replied_unique_id,))
             row = cursor.fetchone()
             conn.close()
-            
-            if row:
-                p_name = row[0]
-                success = await send_product_to_dm(user_id, p_name)
-                if not success:
-                    await message.reply(f"@{message.from_user.username}, narxni bilish uchun lichkamga o'ting!", reply_markup=markup)
-            else:
-                await message.reply("Bu mahsulot topilmadi. Iltimos, rasmga reply qilib so'rang.")
+            if row: p_name = row[0]
         else:
-            # Shunchaki narx so'ralgan
             last_3 = get_last_3_products()
-            success_count = 0
-            for p in last_3:
-                if await send_product_to_dm(user_id, p[1]):
-                    success_count += 1
-            
-            if success_count == 0:
-                await message.reply(f"@{message.from_user.username}, narxni bilish uchun lichkamga o'ting!", reply_markup=markup)
+
+        user_question = message.text or message.caption or "Narx so'rovi"
+        try:
+            if is_reply_to_photo and p_name:
+                photos = get_product_photos(p_name)
+                best_photo_path = photos[0][1] if photos and photos[0][1] else None
+                
+                ai_instruction = f"Mijoz guruhda rasmga reply qilib '{user_question}' deb so'radi. Mahsulot: {p_name}. SEN salomlashib, mahsulot haqida ma'lumot ber va savdolashishni boshla."
+                res_text = await send_claude_message(user_id, ai_instruction, image_path=best_photo_path)
+                
+                await bot.send_message(user_id, res_text)
+                if photos:
+                    media = []
+                    for p_tuple in photos:
+                        file_input = get_photo_input(p_tuple[0], p_tuple[1])
+                        if file_input:
+                            media.append(InputMediaPhoto(media=file_input))
+                    if media:
+                        await bot.send_media_group(user_id, media)
+            elif not is_reply_to_photo and last_3:
+                p_list_text = "\n".join([f"{i+1}. {p[1]} - {p[2]} so'm" for i, p in enumerate(last_3)])
+                ai_instruction = f"Mijoz guruhda umumiy narx so'radi. Men unga ohirgi 3 ta mahsulotni yubordim:\n{p_list_text}\n\nSEN xushmuomala bilan salomlashib 'Siz tanlagan mahsulotimiz shular orasida bormi?' deb so'ra."
+                res_text = await send_claude_message(user_id, ai_instruction)
+                await bot.send_message(user_id, res_text)
+                
+                for i, p in enumerate(last_3):
+                    p_photos = get_product_photos(p[1])
+                    if p_photos:
+                        file_input = get_photo_input(p_photos[0][0], p_photos[0][1])
+                        if file_input:
+                            await bot.send_photo(user_id, file_input, caption=f"{i+1}. {p[1]}")
             else:
-                await message.reply(f"@{message.from_user.username}, oxirgi mahsulotlarimizni lichkangizga yubordim!")
+                dm_state = dp.fsm.resolve_context(bot, user_id, user_id)
+                await process_ai_message(user_id, user_id, user_question, dm_state, show_typing=False)
+        except TelegramForbiddenError:
+            bot_info = await bot.get_me()
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Botga kirish", url=f"https://t.me/{bot_info.username}")]
+            ])
+            await message.reply("Bizdan foydalanish uchun avval botga start tugmasini bosing.", reply_markup=markup)
+        except Exception as e:
+            logging.error(f"Group interaction error: {e}")
+        else:
+            await message.reply("Sizga shaxsiy xabarda javob yubordik.")
 
 @dp.message(OrderState.waiting_for_name)
 async def get_name(message: types.Message, state: FSMContext):

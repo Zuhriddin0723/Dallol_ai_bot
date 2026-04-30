@@ -8,9 +8,15 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
+from dotenv import load_dotenv
+
+# .env faylini yuklash
+load_dotenv()
+
 # Admin bot o'zining tokeni
-TOKEN = "8268202573:AAFo-TuIs9hnEsNbWBsuix_Yx7InN-vkzgw"
-ADMIN_IDS = [1621989960,7611428203]
+TOKEN = os.getenv("ADMIN_BOT_TOKEN")
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(aid) for aid in ADMIN_IDS_STR.split(",") if aid.strip()]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PHOTOS_DIR = os.path.join(BASE_DIR, "photos")
@@ -18,7 +24,7 @@ DB_PATH = os.path.join(BASE_DIR, "products.db")
 os.makedirs(PHOTOS_DIR, exist_ok=True)
 
 bot = Bot(token=TOKEN)
-monitor_bot = Bot(token="8681144550:AAH4ulohF2-JLA4RSLJzSgtlTXCVE8k8ZGI")
+monitor_bot = Bot(token=os.getenv("MONITOR_BOT_TOKEN"))
 dp = Dispatcher()
 
 class AddProduct(StatesGroup):
@@ -181,12 +187,23 @@ async def process_stock(message: types.Message, state: FSMContext):
 
 @dp.message(AddProduct.photo, F.photo | F.text)
 async def process_photo(message: types.Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    file_unique_id = message.photo[-1].file_unique_id
+    if not message.photo:
+        await message.answer("Iltimos, rasm yuboring!")
+        return
+        
+    photo = message.photo[-1]
+    photo_id = photo.file_id
+    file_unique_id = photo.file_unique_id
+    
+    # Rasmni yuklab olish
+    file_path = os.path.join(PHOTOS_DIR, f"{file_unique_id}.jpg")
+    if not os.path.exists(file_path):
+        file = await bot.get_file(photo_id)
+        await bot.download_file(file.file_path, file_path)
     
     data = await state.get_data()
     photos = data.get('photos', [])
-    photos.append({'id': photo_id, 'unique': file_unique_id})
+    photos.append({'id': photo_id, 'unique': file_unique_id, 'path': file_path})
     await state.update_data(photos=photos)
     
     await message.answer("Rasm qo'shildi. Yana rasm qo'shasizmi?", reply_markup=get_yes_no_keyboard())
@@ -210,8 +227,8 @@ async def process_more_photos(message: types.Message, state: FSMContext):
             product_id = cursor.lastrowid
             
             for p in d['photos']:
-                cursor.execute("INSERT INTO product_photos (product_id, photo_id, file_unique_id) VALUES (?, ?, ?)",
-                               (product_id, p['id'], p['unique']))
+                cursor.execute("INSERT INTO product_photos (product_id, photo_id, file_unique_id, file_path) VALUES (?, ?, ?, ?)",
+                               (product_id, p['id'], p['unique'], p['path']))
             
             conn.commit()
             await message.answer(f"✅ Mahsulot muvaffaqiyatli qo'shildi! (ID: {product_id})", reply_markup=get_admin_keyboard())
@@ -293,10 +310,26 @@ async def process_delete(message: types.Message, state: FSMContext):
     pid = message.text
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    # 1. Rasmlar yo'llarini olish
+    cursor.execute("SELECT file_path FROM product_photos WHERE product_id = ?", (pid,))
+    photo_paths = cursor.fetchall()
+    
+    # 2. Fizik fayllarni o'chirish
+    for (ppath,) in photo_paths:
+        if ppath and os.path.exists(ppath):
+            try:
+                os.remove(ppath)
+            except Exception as e:
+                logging.error(f"Faylni o'chirishda xato {ppath}: {e}")
+    
+    # 3. Bazadan o'chirish (avval rasm jadvallari, keyin mahsulot)
+    cursor.execute("DELETE FROM product_photos WHERE product_id = ?", (pid,))
     cursor.execute("DELETE FROM products WHERE id = ?", (pid,))
+    
     conn.commit()
     conn.close()
-    await message.answer(f"✅ Mahsulot #{pid} o'chirildi.")
+    await message.answer(f"✅ Mahsulot #{pid} va unga tegishli barcha ma'lumotlar (rasmlar bilan birga) o'chirildi.")
     await state.clear()
 
 @dp.message(F.text == "🔔 Buyurtmalar")
